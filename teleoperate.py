@@ -84,7 +84,6 @@ SHARED_STATE = {
 
 MAX_TOLERANCE_PX = 30.0
 TOLERANCE_THRESHOLD_PX = 15.0
-# Reduced trim and buffer to ensure we don't accidentally cut off valid parts of the trace
 LEFT_TRIM_PX = 30 
 EDGE_BUFFER_PX = 20
 
@@ -117,7 +116,6 @@ def get_estimated_curve(thresh_img):
     
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        # Wider acceptance area to catch dashes in different lighting
         if 5 < area < 1000:
             M = cv2.moments(cnt)
             if M["m00"] > 0:
@@ -152,7 +150,6 @@ def get_estimated_curve(thresh_img):
         return thresh_img
     
     try:
-        # Dynamically set k based on available points to prevent crash
         k_val = min(3, len(sorted_pts) - 1)
         tck, u = splprep([sorted_pts[:,0], sorted_pts[:,1]], s=0, k=k_val)
         u_new = np.linspace(u.min(), u.max(), 1000)
@@ -172,9 +169,13 @@ def evaluate_tracing(img_start, img_end):
     _, thresh_start = cv2.threshold(gray_start, 100, 255, cv2.THRESH_BINARY_INV)
     target_path = get_estimated_curve(thresh_start)
 
-    diff = cv2.absdiff(gray_end, gray_start)
-    # Lowered threshold to 40 so it registers faint marker strokes
-    _, drawn_mask = cv2.threshold(diff, 40, 255, cv2.THRESH_BINARY)
+    # Blur slightly to combat camera noise before taking the absolute difference
+    blur_start = cv2.GaussianBlur(gray_start, (3, 3), 0)
+    blur_end = cv2.GaussianBlur(gray_end, (3, 3), 0)
+    diff = cv2.absdiff(blur_end, blur_start)
+    
+    # Lowered threshold to 25 to catch faint ink from the camera feed
+    _, drawn_mask = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
     
     kernel_clean = np.ones((3, 3), np.uint8)
     drawn_mask = cv2.morphologyEx(drawn_mask, cv2.MORPH_OPEN, kernel_clean)
@@ -182,8 +183,8 @@ def evaluate_tracing(img_start, img_end):
     contours, _ = cv2.findContours(drawn_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     clean_drawn_mask = np.zeros_like(drawn_mask)
     for cnt in contours:
-        # Lowered area requirement to 30 so thin lines aren't ignored
-        if cv2.contourArea(cnt) > 30: 
+        # Lowered area filter to 15 so thin/faint lines are not ignored
+        if cv2.contourArea(cnt) > 15: 
             cv2.drawContours(clean_drawn_mask, [cnt], -1, 255, thickness=cv2.FILLED)
     drawn_mask = clean_drawn_mask
 
@@ -209,23 +210,13 @@ def evaluate_tracing(img_start, img_end):
     return mean_error, max_error, accuracy_mean, accuracy_in_bounds, target_path, drawn_mask
 
 def create_dashboard(crop_start, crop_end, target_mask, drawn_mask, mean_err, max_err, acc_mean, acc_bounds):
-    h, w, _ = crop_start.shape
+    # --- BULLETPROOF FIXED DASHBOARD LAYOUT ---
+    # We create a constant size canvas regardless of what shape the camera images are
+    PANEL_W, PANEL_H = 640, 640
+    FOOTER_H = 200
+    dash = np.ones((PANEL_H + FOOTER_H, PANEL_W * 2, 3), dtype=np.uint8) * 255
     
-    # --- FIX: Standardize Dashboard Minimum Width ---
-    # Prevents UI text from squishing and overlapping when the cropped image is narrow
-    MIN_PANEL_W = 600
-    if w < MIN_PANEL_W:
-        scale = MIN_PANEL_W / w
-        h = int(h * scale)
-        w = MIN_PANEL_W
-        crop_start = cv2.resize(crop_start, (w, h))
-        crop_end = cv2.resize(crop_end, (w, h))
-        target_mask = cv2.resize(target_mask, (w, h), interpolation=cv2.INTER_NEAREST)
-        drawn_mask = cv2.resize(drawn_mask, (w, h), interpolation=cv2.INTER_NEAREST)
-
-    footer_height = 200
-    dash = np.ones((h + footer_height, w * 2, 3), dtype=np.uint8) * 255
-    
+    # Generate transparent overlays based on native cropped images first for accuracy
     radius = int(TOLERANCE_THRESHOLD_PX)
     k_size = radius * 2 + 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
@@ -236,41 +227,66 @@ def create_dashboard(crop_start, crop_end, target_mask, drawn_mask, mean_err, ma
     left_overlay[tolerance_mask > 0] = [170, 255, 170]
     cv2.addWeighted(left_overlay, 0.4, left_panel, 0.6, 0, left_panel)
     left_panel[target_mask > 0] = [0, 200, 0] 
-    dash[0:h, 0:w] = left_panel
     
     right_panel = crop_end.copy()
     right_overlay = right_panel.copy()
     right_overlay[tolerance_mask > 0] = [170, 255, 170] 
     cv2.addWeighted(right_overlay, 0.4, right_panel, 0.6, 0, right_panel)
     right_panel[target_mask > 0] = [0, 200, 0] 
-    dash[0:h, w:w*2] = right_panel
     
-    cv2.line(dash, (w, 0), (w, h), (0, 0, 0), 4)
+    # Helper to perfectly letterbox images into the fixed dashboard panels
+    def resize_to_fit(img, max_w, max_h):
+        h, w = img.shape[:2]
+        scale = min(max_w / w, max_h / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        
+        canvas = np.ones((max_h, max_w, 3), dtype=np.uint8) * 255
+        x_off = (max_w - new_w) // 2
+        y_off = (max_h - new_h) // 2
+        canvas[y_off:y_off+new_h, x_off:x_off+new_w] = resized
+        return canvas
+
+    # Place resized images onto the final dashboard
+    left_fit = resize_to_fit(left_panel, PANEL_W, PANEL_H)
+    right_fit = resize_to_fit(right_panel, PANEL_W, PANEL_H)
+    
+    dash[0:PANEL_H, 0:PANEL_W] = left_fit
+    dash[0:PANEL_H, PANEL_W:PANEL_W*2] = right_fit
+    
+    # Draw fixed UI Elements (Guaranteed not to overlap)
+    cv2.line(dash, (PANEL_W, 0), (PANEL_W, PANEL_H), (0, 0, 0), 4)
     font = cv2.FONT_HERSHEY_SIMPLEX
     
-    cv2.rectangle(dash, (10, 10), (450, 100), (255, 255, 255), -1)
-    cv2.putText(dash, "FINAL TRACE", (30, 50), font, 1.2, (0, 0, 0), 3)
-    cv2.putText(dash, "(ESTIMATED CURVE)", (30, 90), font, 0.9, (50, 50, 50), 2)
+    # Left Header
+    cv2.rectangle(dash, (20, 10), (450, 100), (255, 255, 255), -1)
+    cv2.putText(dash, "FINAL TRACE", (40, 50), font, 1.2, (0, 0, 0), 3)
+    cv2.putText(dash, "(ESTIMATED CURVE)", (40, 90), font, 0.9, (50, 50, 50), 2)
     
-    cv2.rectangle(dash, (w + 10, 10), (w + 400, 100), (255, 255, 255), -1)
-    cv2.putText(dash, "FINAL TRACE", (w + 30, 50), font, 1.2, (0, 0, 0), 3)
-    cv2.putText(dash, "(ACTUAL RESULT)", (w + 30, 90), font, 0.9, (50, 50, 50), 2)
+    # Right Header
+    cv2.rectangle(dash, (PANEL_W + 20, 10), (PANEL_W + 450, 100), (255, 255, 255), -1)
+    cv2.putText(dash, "FINAL TRACE", (PANEL_W + 40, 50), font, 1.2, (0, 0, 0), 3)
+    cv2.putText(dash, "(ACTUAL RESULT)", (PANEL_W + 40, 90), font, 0.9, (50, 50, 50), 2)
     
-    cv2.rectangle(dash, (0, h), (w * 2, h + footer_height), (45, 40, 40), -1)
+    # Footer Panel
+    h = PANEL_H
+    w = PANEL_W
+    cv2.rectangle(dash, (0, h), (w * 2, h + FOOTER_H), (45, 40, 40), -1)
     cv2.putText(dash, "PERFORMANCE EVALUATION:", (40, h + 50), font, 1.2, (200, 200, 200), 2)
-    cv2.putText(dash, f"MEAN SCORE:    {acc_mean:.1f}%", (40, h + 105), font, 1.5, (255, 255, 255), 3)
-    cv2.putText(dash, f"WITHIN {int(TOLERANCE_THRESHOLD_PX)}PX:    {acc_bounds:.1f}%", (40, h + 155), font, 1.5, (150, 255, 150), 3)
+    cv2.putText(dash, f"MEAN SCORE:    {acc_mean:.1f}%", (40, h + 115), font, 1.5, (255, 255, 255), 3)
+    cv2.putText(dash, f"WITHIN {int(TOLERANCE_THRESHOLD_PX)}PX:    {acc_bounds:.1f}%", (40, h + 165), font, 1.5, (150, 255, 150), 3)
     
+    # Stats Box in Footer
     box_x = int(w * 1.3)
-    cv2.rectangle(dash, (box_x, h + 30), (box_x + 350, h + 160), (60, 55, 55), -1)
-    cv2.rectangle(dash, (box_x, h + 30), (box_x + 350, h + 160), (100, 100, 100), 2)
+    cv2.rectangle(dash, (box_x, h + 30), (box_x + 350, h + FOOTER_H - 30), (60, 55, 55), -1)
+    cv2.rectangle(dash, (box_x, h + 30), (box_x + 350, h + FOOTER_H - 30), (100, 100, 100), 2)
     
     cv2.putText(dash, f"Mean Error: {mean_err:.2f} px", (box_x + 20, h + 75), font, 0.8, (255, 255, 255), 2)
     cv2.putText(dash, f"Max Error:  {max_err:.2f} px", (box_x + 20, h + 115), font, 0.8, (255, 255, 255), 2)
     
     status_text = "PASS" if acc_bounds >= 85.0 else "FAIL"
     status_color = (100, 200, 100) if status_text == "PASS" else (50, 50, 255)
-    cv2.putText(dash, status_text, (box_x + 200, h + 145), font, 1.2, status_color, 3)
+    cv2.putText(dash, status_text, (box_x + 200, h + 155), font, 1.2, status_color, 3)
 
     return dash
 
@@ -302,7 +318,7 @@ def run_evaluation_from_memory(raw_start, raw_end):
     print(f"Mean Score:      {acc_mean:.1f}%")
     print(f"Within {int(TOLERANCE_THRESHOLD_PX)}px:      {acc_bounds:.1f}%")
     
-    # Optional scaling for monitors
+    # Scale down slightly if the dashboard is larger than the screen
     if dashboard_img.shape[0] > 900:
         scale = 900 / dashboard_img.shape[0]
         dashboard_img = cv2.resize(dashboard_img, (0,0), fx=scale, fy=scale)

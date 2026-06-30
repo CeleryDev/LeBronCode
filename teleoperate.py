@@ -75,7 +75,8 @@ SHARED_STATE = {
     "ui_msg": "",
     "start_frame": None,
     "end_frame": None,
-    "stop_teleop": False
+    "stop_teleop": False,
+    "eval_img_to_show": None  # Holds the finished dashboard for the main thread to display
 }
 
 # ==========================================
@@ -210,7 +211,7 @@ def evaluate_tracing(img_start, img_end):
     return mean_error, max_error, accuracy_mean, accuracy_in_bounds, target_path, drawn_mask
 
 def create_dashboard(crop_start, crop_end, target_mask, drawn_mask, mean_err, max_err, acc_mean, acc_bounds):
-    # --- BULLETPROOF FIXED DASHBOARD LAYOUT ---
+    # Fixed dashboard layout guarantees UI elements never overlap
     PANEL_W, PANEL_H = 640, 640
     FOOTER_H = 200
     dash = np.ones((PANEL_H + FOOTER_H, PANEL_W * 2, 3), dtype=np.uint8) * 255
@@ -309,14 +310,13 @@ def run_evaluation_from_memory(raw_start, raw_end):
     print(f"Mean Score:      {acc_mean:.1f}%")
     print(f"Within {int(TOLERANCE_THRESHOLD_PX)}px:      {acc_bounds:.1f}%")
     
-    if dashboard_img.shape[0] > 900:
-        scale = 900 / dashboard_img.shape[0]
+    if dashboard_img.shape[0] > 800:
+        scale = 800 / dashboard_img.shape[0]
         dashboard_img = cv2.resize(dashboard_img, (0,0), fx=scale, fy=scale)
     
-    print("\nEvaluation complete! Close the image window to continue teleoperating.")
-    cv2.imshow("ACT Policy Evaluation", dashboard_img)
-    cv2.waitKey(0) # Pauses the background thread until the window is closed
-    cv2.destroyWindow("ACT Policy Evaluation")
+    # Send the finished image buffer to the main thread to be displayed
+    SHARED_STATE["eval_img_to_show"] = dashboard_img
+    SHARED_STATE["ui_msg"] = "Evaluation Complete!"
 
 # ==========================================
 # --- TKINTER UI THREAD ---
@@ -345,7 +345,6 @@ def start_ui_thread():
         SHARED_STATE["cmd_capture_end"] = True
         status_var.set("Status: Capturing END & Evaluating...")
 
-    # Tell the teleoperation loop to stop when the UI window is closed
     def on_closing():
         SHARED_STATE["stop_teleop"] = True
         root.destroy()
@@ -363,7 +362,6 @@ def start_ui_thread():
             status_var.set(f"Status: {SHARED_STATE['ui_msg']}")
             SHARED_STATE["ui_msg"] = ""
             
-        # If the teleop loop triggered an evaluation, run it in a separate thread
         if SHARED_STATE["cmd_run_eval"]:
             SHARED_STATE["cmd_run_eval"] = False
             threading.Thread(
@@ -410,11 +408,15 @@ def teleop_loop(
     display_len = max(len(key) for key in robot.action_features)
     start = time.perf_counter()
     
+    cv_window_name = "ACT Policy Evaluation"
+    is_window_open = False
+
     try:
         while not SHARED_STATE["stop_teleop"]:
             loop_start = time.perf_counter()
             obs = robot.get_observation()
 
+            # --- 1. HANDLE UI CAPTURE TRIGGERS ---
             if SHARED_STATE["cmd_capture_start"]:
                 if "topRight" in obs:
                     frame = obs["topRight"]
@@ -431,12 +433,12 @@ def teleop_loop(
                     SHARED_STATE["end_frame"] = frame.clone() if hasattr(frame, 'clone') else frame.copy()
                     SHARED_STATE["ui_msg"] = "End Image Captured!"
                     print("\n[EVALUATOR] End image captured. Running evaluation in background...")
-                    # Trigger the background evaluation thread without breaking the loop
                     SHARED_STATE["cmd_run_eval"] = True 
                 else:
                     SHARED_STATE["ui_msg"] = "Error: 'topRight' camera not found."
                 SHARED_STATE["cmd_capture_end"] = False
 
+            # --- 2. HANDLE TELEOPERATION ---
             if robot.name == "unitree_g1":
                 teleop.send_feedback(obs)
 
@@ -459,11 +461,31 @@ def teleop_loop(
                     print(f"{motor:<{display_len}} | {value:>7.2f}")
                 move_cursor_up(len(robot_action_to_send) + 3)
 
+            # --- 3. HANDLE OPEN-CV WINDOW IN MAIN THREAD ---
+            # This completely avoids Linux thread-locking issues.
+            if SHARED_STATE.get("eval_img_to_show") is not None:
+                cv2.imshow(cv_window_name, SHARED_STATE["eval_img_to_show"])
+                SHARED_STATE["eval_img_to_show"] = None
+                is_window_open = True
+                
+            if is_window_open:
+                try:
+                    # Check if user clicked the 'X' to close the OpenCV window
+                    if cv2.getWindowProperty(cv_window_name, cv2.WND_PROP_VISIBLE) < 1:
+                        is_window_open = False
+                    else:
+                        cv2.waitKey(1) # Keep window responsive (adds 1ms, safe for 60Hz loop)
+                except cv2.error:
+                    is_window_open = False
+
+            # --- 4. MAINTAIN TIMING ---
             dt_s = time.perf_counter() - loop_start
             precise_sleep(max(1 / fps - dt_s, 0.0))
-            loop_s = time.perf_counter() - loop_start
-            print(f"Teleop loop time: {loop_s * 1e3:.2f}ms ({1 / loop_s:.0f} Hz)")
-            move_cursor_up(1)
+            
+            # Print stats to terminal occasionally to avoid console spam
+            # loop_s = time.perf_counter() - loop_start
+            # print(f"Teleop loop time: {loop_s * 1e3:.2f}ms ({1 / loop_s:.0f} Hz)")
+            # move_cursor_up(1)
 
             if duration is not None and time.perf_counter() - start >= duration:
                 break

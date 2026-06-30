@@ -1,19 +1,10 @@
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# (License text omitted for brevity)
 
 import logging
 import time
+import threading
+import tkinter as tk
 from dataclasses import asdict, dataclass
 from pprint import pformat
 
@@ -35,44 +26,30 @@ from lerobot.processor import (
 from lerobot.robots import (
     Robot,
     RobotConfig,
-    bi_openarm_follower,
-    bi_rebot_b601_follower,
-    bi_so_follower,
-    earthrover_mini_plus,
-    hope_jr,
-    koch_follower,
     make_robot_from_config,
-    omx_follower,
-    openarm_follower,
-    reachy2,
-    rebot_b601_follower,
-    so_follower,
-    unitree_g1 as unitree_g1_robot,
 )
 from lerobot.teleoperators import (
     Teleoperator,
     TeleoperatorConfig,
-    bi_openarm_leader,
-    bi_openarm_mini,
-    bi_rebot_102_leader,
-    bi_so_leader,
-    gamepad,
-    homunculus,
-    keyboard,
-    koch_leader,
     make_teleoperator_from_config,
-    omx_leader,
-    openarm_leader,
-    openarm_mini,
-    reachy2_teleoperator,
-    rebot_102_leader,
-    so_leader,
-    unitree_g1,
 )
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging, move_cursor_up
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data, shutdown_rerun
+
+# ==========================================
+# --- SHARED STATE & THREADING ---
+# ==========================================
+
+SHARED_STATE = {
+    "cmd_capture_start": False,
+    "cmd_capture_end": False,
+    "ui_msg": "",
+    "start_frame": None,
+    "end_frame": None,
+    "stop_teleop": False
+}
 
 # ==========================================
 # --- COMPUTER VISION EVALUATION SCRIPT ---
@@ -246,11 +223,9 @@ def convert_lerobot_to_cv2(img_data):
     if hasattr(img_data, 'cpu'):
         img_data = img_data.cpu().numpy()
         
-    # Check if format is (Channels, Height, Width) and convert to (Height, Width, Channels)
     if img_data.ndim == 3 and img_data.shape[0] == 3:
         img_data = np.transpose(img_data, (1, 2, 0))
         
-    # Un-normalize [0, 1] floats to [0, 255] uint8 if necessary
     if img_data.dtype == np.float32 or img_data.dtype == np.float64:
         if img_data.max() <= 1.0:
             img_data = (img_data * 255).astype(np.uint8)
@@ -272,7 +247,6 @@ def run_evaluation_from_memory(raw_start, raw_end):
     print(f"Mean Score:      {acc_mean:.1f}%")
     print(f"Within {int(TOLERANCE_THRESHOLD_PX)}px:      {acc_bounds:.1f}%")
     
-    # Scale for display on Linux screens
     if dashboard_img.shape[0] > 900:
         scale = 900 / dashboard_img.shape[0]
         dashboard_img = cv2.resize(dashboard_img, (0,0), fx=scale, fy=scale)
@@ -280,6 +254,55 @@ def run_evaluation_from_memory(raw_start, raw_end):
     print("\nEvaluation complete! Close the image window to fully exit.")
     cv2.imshow("ACT Policy Evaluation", dashboard_img)
     cv2.waitKey(0)
+
+# ==========================================
+# --- TKINTER UI THREAD ---
+# ==========================================
+
+def start_ui_thread():
+    root = tk.Tk()
+    root.title("LeRobot Evaluator")
+    root.geometry("350x220")
+    root.configure(padx=20, pady=20)
+
+    title_label = tk.Label(root, text="Line Tracing Evaluator", font=("Helvetica", 14, "bold"))
+    title_label.pack(pady=(0, 15))
+
+    status_var = tk.StringVar(value="Status: Ready")
+    
+    def btn_start():
+        SHARED_STATE["cmd_capture_start"] = True
+        status_var.set("Status: Waiting to grab START frame...")
+        
+    def btn_end():
+        if SHARED_STATE["start_frame"] is None:
+            status_var.set("Status: Error! Capture START first.")
+            return
+            
+        SHARED_STATE["cmd_capture_end"] = True
+        status_var.set("Status: Capturing END & Evaluating...")
+
+    tk.Button(root, text="1. Capture START Image", command=btn_start, width=25, height=2, bg="#e0e0e0").pack(pady=5)
+    tk.Button(root, text="2. Capture END & Evaluate", command=btn_end, width=25, height=2, bg="#4CAF50", fg="black").pack(pady=10)
+    
+    status_label = tk.Label(root, textvariable=status_var, font=("Helvetica", 10, "italic"), fg="blue")
+    status_label.pack(side=tk.BOTTOM)
+
+    def check_status():
+        if SHARED_STATE["ui_msg"]:
+            status_var.set(f"Status: {SHARED_STATE['ui_msg']}")
+            SHARED_STATE["ui_msg"] = ""
+            
+        # Automatically close the Tkinter window once teleop stops
+        if SHARED_STATE["stop_teleop"]:
+            root.quit()
+            return
+            
+        root.after(100, check_status)
+
+    check_status()
+    root.mainloop()
+
 
 # ==========================================
 # --- TELEOPERATION LOGIC ---
@@ -310,25 +333,33 @@ def teleop_loop(
     display_len = max(len(key) for key in robot.action_features)
     start = time.perf_counter()
     
-    start_frame_raw = None
-    end_frame_raw = None
-    
     try:
-        while True:
+        while not SHARED_STATE["stop_teleop"]:
             loop_start = time.perf_counter()
             obs = robot.get_observation()
 
-            # --- In-Memory Auto-Capture ---
-            # We copy/clone the tensor directly to avoid slowing down the active loop
-            # Processing to CV2 is delayed until the evaluation phase
-            if "topRight" in obs:
-                frame_data = obs["topRight"]
-                if start_frame_raw is None:
-                    start_frame_raw = frame_data.clone() if hasattr(frame_data, 'clone') else frame_data.copy()
-                    print("\n[EVALUATOR] Captured starting baseline automatically.")
+            # --- IN-MEMORY UI CAPTURE TRIGGERS ---
+            if SHARED_STATE["cmd_capture_start"]:
+                if "topRight" in obs:
+                    frame = obs["topRight"]
+                    SHARED_STATE["start_frame"] = frame.clone() if hasattr(frame, 'clone') else frame.copy()
+                    SHARED_STATE["ui_msg"] = "Start Image Captured!"
+                    print("\n[EVALUATOR] Start image captured from memory.")
+                else:
+                    SHARED_STATE["ui_msg"] = "Error: 'topRight' camera not found."
+                SHARED_STATE["cmd_capture_start"] = False
                 
-                # Continuously update the end frame so it's always the most recent
-                end_frame_raw = frame_data.clone() if hasattr(frame_data, 'clone') else frame_data.copy()
+            if SHARED_STATE["cmd_capture_end"]:
+                if "topRight" in obs:
+                    frame = obs["topRight"]
+                    SHARED_STATE["end_frame"] = frame.clone() if hasattr(frame, 'clone') else frame.copy()
+                    SHARED_STATE["ui_msg"] = "End Image Captured!"
+                    print("\n[EVALUATOR] End image captured. Exiting teleop loop...")
+                    # Setting this to True breaks the loop immediately
+                    SHARED_STATE["stop_teleop"] = True 
+                else:
+                    SHARED_STATE["ui_msg"] = "Error: 'topRight' camera not found."
+                SHARED_STATE["cmd_capture_end"] = False
 
             if robot.name == "unitree_g1":
                 teleop.send_feedback(obs)
@@ -363,8 +394,7 @@ def teleop_loop(
                 
     except KeyboardInterrupt:
         print("\n\nTeleoperation interrupted by user (Ctrl+C).")
-        
-    return start_frame_raw, end_frame_raw
+        SHARED_STATE["stop_teleop"] = True
 
 
 @parser.wrap()
@@ -386,12 +416,13 @@ def teleoperate(cfg: TeleoperateConfig):
     teleop.connect()
     robot.connect()
 
-    start_img = None
-    end_img = None
-    
+    # Launch Tkinter UI in a background daemon thread
+    ui_thread = threading.Thread(target=start_ui_thread, daemon=True)
+    ui_thread.start()
+
     try:
-        # Loop returns the captured frames when it completes (or when Ctrl+C is pressed)
-        start_img, end_img = teleop_loop(
+        # This will run continuously until you click "Capture END" in the UI (or hit Ctrl+C)
+        teleop_loop(
             teleop=teleop,
             robot=robot,
             fps=cfg.fps,
@@ -405,16 +436,16 @@ def teleoperate(cfg: TeleoperateConfig):
     finally:
         if cfg.display_data:
             shutdown_rerun()
-        
-        # Safely disconnect the hardware BEFORE opening the CV window 
-        # so the robot motors don't lock up or cause USB issues
-        print("\nDisconnecting hardware...")
+            
+        print("\nDisconnecting hardware safely before running CV Evaluation...")
         teleop.disconnect()
         robot.disconnect()
         
-        # Run the evaluation if we successfully captured frames
-        if start_img is not None and end_img is not None:
-            run_evaluation_from_memory(start_img, end_img)
+        # If both frames were successfully captured, run the evaluation popup!
+        if SHARED_STATE["start_frame"] is not None and SHARED_STATE["end_frame"] is not None:
+            run_evaluation_from_memory(SHARED_STATE["start_frame"], SHARED_STATE["end_frame"])
+        else:
+            print("\nEvaluation skipped: Start or End frame was not captured.")
 
 def main():
     register_third_party_plugins()

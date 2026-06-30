@@ -325,7 +325,6 @@ def run_evaluation_from_memory(raw_start, raw_end):
     print("\nEvaluation complete! Close the image window to fully exit.")
     cv2.imshow("ACT Policy Evaluation", dashboard_img)
     cv2.waitKey(0)
-    cv2.destroyAllWindows()
 
 # ==========================================
 # --- TKINTER UI THREAD ---

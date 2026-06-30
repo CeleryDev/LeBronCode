@@ -71,6 +71,7 @@ from lerobot.utils.visualization_utils import init_rerun, log_rerun_data, shutdo
 SHARED_STATE = {
     "cmd_capture_start": False,
     "cmd_capture_end": False,
+    "cmd_run_eval": False,
     "ui_msg": "",
     "start_frame": None,
     "end_frame": None,
@@ -210,12 +211,10 @@ def evaluate_tracing(img_start, img_end):
 
 def create_dashboard(crop_start, crop_end, target_mask, drawn_mask, mean_err, max_err, acc_mean, acc_bounds):
     # --- BULLETPROOF FIXED DASHBOARD LAYOUT ---
-    # We create a constant size canvas regardless of what shape the camera images are
     PANEL_W, PANEL_H = 640, 640
     FOOTER_H = 200
     dash = np.ones((PANEL_H + FOOTER_H, PANEL_W * 2, 3), dtype=np.uint8) * 255
     
-    # Generate transparent overlays based on native cropped images first for accuracy
     radius = int(TOLERANCE_THRESHOLD_PX)
     k_size = radius * 2 + 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
@@ -233,7 +232,6 @@ def create_dashboard(crop_start, crop_end, target_mask, drawn_mask, mean_err, ma
     cv2.addWeighted(right_overlay, 0.4, right_panel, 0.6, 0, right_panel)
     right_panel[target_mask > 0] = [0, 200, 0] 
     
-    # Helper to perfectly letterbox images into the fixed dashboard panels
     def resize_to_fit(img, max_w, max_h):
         h, w = img.shape[:2]
         scale = min(max_w / w, max_h / h)
@@ -246,28 +244,23 @@ def create_dashboard(crop_start, crop_end, target_mask, drawn_mask, mean_err, ma
         canvas[y_off:y_off+new_h, x_off:x_off+new_w] = resized
         return canvas
 
-    # Place resized images onto the final dashboard
     left_fit = resize_to_fit(left_panel, PANEL_W, PANEL_H)
     right_fit = resize_to_fit(right_panel, PANEL_W, PANEL_H)
     
     dash[0:PANEL_H, 0:PANEL_W] = left_fit
     dash[0:PANEL_H, PANEL_W:PANEL_W*2] = right_fit
     
-    # Draw fixed UI Elements (Guaranteed not to overlap)
     cv2.line(dash, (PANEL_W, 0), (PANEL_W, PANEL_H), (0, 0, 0), 4)
     font = cv2.FONT_HERSHEY_SIMPLEX
     
-    # Left Header
     cv2.rectangle(dash, (20, 10), (450, 100), (255, 255, 255), -1)
     cv2.putText(dash, "FINAL TRACE", (40, 50), font, 1.2, (0, 0, 0), 3)
     cv2.putText(dash, "(ESTIMATED CURVE)", (40, 90), font, 0.9, (50, 50, 50), 2)
     
-    # Right Header
     cv2.rectangle(dash, (PANEL_W + 20, 10), (PANEL_W + 450, 100), (255, 255, 255), -1)
     cv2.putText(dash, "FINAL TRACE", (PANEL_W + 40, 50), font, 1.2, (0, 0, 0), 3)
     cv2.putText(dash, "(ACTUAL RESULT)", (PANEL_W + 40, 90), font, 0.9, (50, 50, 50), 2)
     
-    # Footer Panel
     h = PANEL_H
     w = PANEL_W
     cv2.rectangle(dash, (0, h), (w * 2, h + FOOTER_H), (45, 40, 40), -1)
@@ -275,7 +268,6 @@ def create_dashboard(crop_start, crop_end, target_mask, drawn_mask, mean_err, ma
     cv2.putText(dash, f"MEAN SCORE:    {acc_mean:.1f}%", (40, h + 115), font, 1.5, (255, 255, 255), 3)
     cv2.putText(dash, f"WITHIN {int(TOLERANCE_THRESHOLD_PX)}PX:    {acc_bounds:.1f}%", (40, h + 165), font, 1.5, (150, 255, 150), 3)
     
-    # Stats Box in Footer
     box_x = int(w * 1.3)
     cv2.rectangle(dash, (box_x, h + 30), (box_x + 350, h + FOOTER_H - 30), (60, 55, 55), -1)
     cv2.rectangle(dash, (box_x, h + 30), (box_x + 350, h + FOOTER_H - 30), (100, 100, 100), 2)
@@ -317,14 +309,14 @@ def run_evaluation_from_memory(raw_start, raw_end):
     print(f"Mean Score:      {acc_mean:.1f}%")
     print(f"Within {int(TOLERANCE_THRESHOLD_PX)}px:      {acc_bounds:.1f}%")
     
-    # Scale down slightly if the dashboard is larger than the screen
     if dashboard_img.shape[0] > 900:
         scale = 900 / dashboard_img.shape[0]
         dashboard_img = cv2.resize(dashboard_img, (0,0), fx=scale, fy=scale)
     
-    print("\nEvaluation complete! Close the image window to fully exit.")
+    print("\nEvaluation complete! Close the image window to continue teleoperating.")
     cv2.imshow("ACT Policy Evaluation", dashboard_img)
-    cv2.waitKey(0)
+    cv2.waitKey(0) # Pauses the background thread until the window is closed
+    cv2.destroyWindow("ACT Policy Evaluation")
 
 # ==========================================
 # --- TKINTER UI THREAD ---
@@ -353,6 +345,13 @@ def start_ui_thread():
         SHARED_STATE["cmd_capture_end"] = True
         status_var.set("Status: Capturing END & Evaluating...")
 
+    # Tell the teleoperation loop to stop when the UI window is closed
+    def on_closing():
+        SHARED_STATE["stop_teleop"] = True
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+
     tk.Button(root, text="1. Capture START Image", command=btn_start, width=25, height=2, bg="#e0e0e0").pack(pady=5)
     tk.Button(root, text="2. Capture END & Evaluate", command=btn_end, width=25, height=2, bg="#4CAF50", fg="black").pack(pady=10)
     
@@ -363,6 +362,15 @@ def start_ui_thread():
         if SHARED_STATE["ui_msg"]:
             status_var.set(f"Status: {SHARED_STATE['ui_msg']}")
             SHARED_STATE["ui_msg"] = ""
+            
+        # If the teleop loop triggered an evaluation, run it in a separate thread
+        if SHARED_STATE["cmd_run_eval"]:
+            SHARED_STATE["cmd_run_eval"] = False
+            threading.Thread(
+                target=run_evaluation_from_memory, 
+                args=(SHARED_STATE["start_frame"], SHARED_STATE["end_frame"]),
+                daemon=True
+            ).start()
             
         if SHARED_STATE["stop_teleop"]:
             root.quit()
@@ -422,8 +430,9 @@ def teleop_loop(
                     frame = obs["topRight"]
                     SHARED_STATE["end_frame"] = frame.clone() if hasattr(frame, 'clone') else frame.copy()
                     SHARED_STATE["ui_msg"] = "End Image Captured!"
-                    print("\n[EVALUATOR] End image captured. Exiting teleop loop...")
-                    SHARED_STATE["stop_teleop"] = True 
+                    print("\n[EVALUATOR] End image captured. Running evaluation in background...")
+                    # Trigger the background evaluation thread without breaking the loop
+                    SHARED_STATE["cmd_run_eval"] = True 
                 else:
                     SHARED_STATE["ui_msg"] = "Error: 'topRight' camera not found."
                 SHARED_STATE["cmd_capture_end"] = False
@@ -502,14 +511,10 @@ def teleoperate(cfg: TeleoperateConfig):
         if cfg.display_data:
             shutdown_rerun()
             
-        print("\nDisconnecting hardware safely before running CV Evaluation...")
+        print("\nDisconnecting hardware safely...")
         teleop.disconnect()
         robot.disconnect()
-        
-        if SHARED_STATE["start_frame"] is not None and SHARED_STATE["end_frame"] is not None:
-            run_evaluation_from_memory(SHARED_STATE["start_frame"], SHARED_STATE["end_frame"])
-        else:
-            print("\nEvaluation skipped: Start or End frame was not captured.")
+        cv2.destroyAllWindows()
 
 def main():
     register_third_party_plugins()

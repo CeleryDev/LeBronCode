@@ -1,25 +1,95 @@
+# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+import time
+from dataclasses import asdict, dataclass
+from pprint import pformat
+
 import cv2
 import numpy as np
-import argparse
-import sys
+import torch
 from scipy.interpolate import splprep, splev
 
-# --- CONFIGURATION ---
-MAX_TOLERANCE_PX = 30.0       # Max pixel distance for the mean accuracy scaling (0% score)
-TOLERANCE_THRESHOLD_PX = 15.0 # Radius in pixels for the strict "In-Bounds" percentage calculation
-LEFT_TRIM_PX = 130            # Trims the robot arm from the left
-EDGE_BUFFER_PX = 50           # Ignores noise/shadows on the extreme edges of the whiteboard
+from lerobot.cameras.opencv import OpenCVCameraConfig
+from lerobot.cameras.realsense import RealSenseCameraConfig
+from lerobot.cameras.zmq import ZMQCameraConfig
+from lerobot.configs import parser
+from lerobot.processor import (
+    RobotAction,
+    RobotObservation,
+    RobotProcessorPipeline,
+    make_default_processors,
+)
+from lerobot.robots import (
+    Robot,
+    RobotConfig,
+    bi_openarm_follower,
+    bi_rebot_b601_follower,
+    bi_so_follower,
+    earthrover_mini_plus,
+    hope_jr,
+    koch_follower,
+    make_robot_from_config,
+    omx_follower,
+    openarm_follower,
+    reachy2,
+    rebot_b601_follower,
+    so_follower,
+    unitree_g1 as unitree_g1_robot,
+)
+from lerobot.teleoperators import (
+    Teleoperator,
+    TeleoperatorConfig,
+    bi_openarm_leader,
+    bi_openarm_mini,
+    bi_rebot_102_leader,
+    bi_so_leader,
+    gamepad,
+    homunculus,
+    keyboard,
+    koch_leader,
+    make_teleoperator_from_config,
+    omx_leader,
+    openarm_leader,
+    openarm_mini,
+    reachy2_teleoperator,
+    rebot_102_leader,
+    so_leader,
+    unitree_g1,
+)
+from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.robot_utils import precise_sleep
+from lerobot.utils.utils import init_logging, move_cursor_up
+from lerobot.utils.visualization_utils import init_rerun, log_rerun_data, shutdown_rerun
+
+# ==========================================
+# --- COMPUTER VISION EVALUATION SCRIPT ---
+# ==========================================
+
+MAX_TOLERANCE_PX = 30.0
+TOLERANCE_THRESHOLD_PX = 15.0
+LEFT_TRIM_PX = 130
+EDGE_BUFFER_PX = 50
 
 def auto_crop_whiteboard(img):
-    """Automatically finds the whiteboard and applies a left-side trim."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (7, 7), 0)
     _, thresh = cv2.threshold(blurred, 140, 255, cv2.THRESH_BINARY)
     
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
     if not contours:
-        print("Warning: Could not automatically detect the whiteboard. Using full image.")
         return 0, 0, img.shape[1], img.shape[0]
         
     largest_contour = max(contours, key=cv2.contourArea)
@@ -36,9 +106,7 @@ def auto_crop_whiteboard(img):
     return x1, y1, (x2 - x1), (y2 - y1)
 
 def get_estimated_curve(thresh_img):
-    """Finds dashes, filters out edge noise, and estimates a smooth SciPy curve."""
     contours, _ = cv2.findContours(thresh_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
     h, w = thresh_img.shape
     centroids = []
     
@@ -49,13 +117,11 @@ def get_estimated_curve(thresh_img):
             if M["m00"] > 0:
                 cx = int(M["m10"] / M["m00"])
                 cy = int(M["m01"] / M["m00"])
-                
                 if (cx > EDGE_BUFFER_PX and cx < (w - EDGE_BUFFER_PX) and 
                     cy > EDGE_BUFFER_PX and cy < (h - EDGE_BUFFER_PX)):
                     centroids.append((cx, cy))
                 
     if len(centroids) < 3:
-        print("Warning: Not enough valid dashes detected to fit a curve.")
         return thresh_img
         
     start_idx = np.argmin([p[1] for p in centroids])
@@ -75,8 +141,7 @@ def get_estimated_curve(thresh_img):
         u_new = np.linspace(u.min(), u.max(), 1000)
         x_new, y_new = splev(u_new, tck, der=0)
         curve_points = np.vstack((x_new, y_new)).T.astype(np.int32)
-    except Exception as e:
-        print(f"Warning: Curve fitting failed ({e}).")
+    except Exception:
         curve_points = sorted_pts
     
     cv2.polylines(curve_mask, [curve_points], False, 255, 3)
@@ -95,7 +160,6 @@ def evaluate_tracing(img_start, img_end):
     kernel_clean = np.ones((3, 3), np.uint8)
     drawn_mask = cv2.morphologyEx(drawn_mask, cv2.MORPH_OPEN, kernel_clean)
 
-    # Filter out stray noise (keep only large continuous chunks of ink)
     contours, _ = cv2.findContours(drawn_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     clean_drawn_mask = np.zeros_like(drawn_mask)
     for cnt in contours:
@@ -103,7 +167,6 @@ def evaluate_tracing(img_start, img_end):
             cv2.drawContours(clean_drawn_mask, [cnt], -1, 255, thickness=cv2.FILLED)
     drawn_mask = clean_drawn_mask
 
-    # Apply edge buffer blackout to evaluation
     h, w = drawn_mask.shape
     drawn_mask[0:EDGE_BUFFER_PX, :] = 0
     drawn_mask[h-EDGE_BUFFER_PX:h, :] = 0
@@ -112,7 +175,6 @@ def evaluate_tracing(img_start, img_end):
 
     inv_target = cv2.bitwise_not(target_path)
     dist_transform = cv2.distanceTransform(inv_target, cv2.DIST_L2, 5)
-
     error_pixels = dist_transform[drawn_mask > 0]
     
     if len(error_pixels) == 0:
@@ -120,7 +182,6 @@ def evaluate_tracing(img_start, img_end):
         
     mean_error = np.mean(error_pixels)
     max_error = np.max(error_pixels)
-    
     accuracy_mean = max(0.0, 100.0 - ((mean_error / MAX_TOLERANCE_PX) * 100.0))
     in_bounds_pixels = np.sum(error_pixels <= TOLERANCE_THRESHOLD_PX)
     accuracy_in_bounds = (in_bounds_pixels / len(error_pixels)) * 100.0
@@ -130,43 +191,27 @@ def evaluate_tracing(img_start, img_end):
 def create_dashboard(crop_start, crop_end, target_mask, drawn_mask, mean_err, max_err, acc_mean, acc_bounds):
     h, w, _ = crop_start.shape
     footer_height = 180
-    
     dash = np.ones((h + footer_height, w * 2, 3), dtype=np.uint8) * 255
     
-    # --- Generate the Faded Tolerance Mask ---
-    # Expand the target line out by the threshold radius
     radius = int(TOLERANCE_THRESHOLD_PX)
     k_size = radius * 2 + 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
     tolerance_mask = cv2.dilate(target_mask, kernel)
 
-    # --- LEFT PANEL (Ideal Overlay) ---
     left_panel = crop_start.copy()
-    
-    # 1. Overlay translucent faded green tolerance zone
     left_overlay = left_panel.copy()
-    left_overlay[tolerance_mask > 0] = [170, 255, 170] # Light pastel green
+    left_overlay[tolerance_mask > 0] = [170, 255, 170]
     cv2.addWeighted(left_overlay, 0.4, left_panel, 0.6, 0, left_panel)
-    
-    # 2. Draw solid target line on top
-    left_panel[target_mask > 0] = [0, 200, 0] # Slightly darker solid green
-    
+    left_panel[target_mask > 0] = [0, 200, 0] 
     dash[0:h, 0:w] = left_panel
     
-    # --- RIGHT PANEL (Result Overlay) ---
     right_panel = crop_end.copy()
-    
-    # 1. Overlay translucent faded green tolerance zone over the drawn ink
     right_overlay = right_panel.copy()
     right_overlay[tolerance_mask > 0] = [170, 255, 170] 
     cv2.addWeighted(right_overlay, 0.4, right_panel, 0.6, 0, right_panel)
-    
-    # 2. Draw solid target line on top
     right_panel[target_mask > 0] = [0, 200, 0] 
-    
     dash[0:h, w:w*2] = right_panel
     
-    # --- UI Elements ---
     cv2.line(dash, (w, 0), (w, h), (0, 0, 0), 4)
     font = cv2.FONT_HERSHEY_SIMPLEX
     
@@ -178,10 +223,8 @@ def create_dashboard(crop_start, crop_end, target_mask, drawn_mask, mean_err, ma
     cv2.putText(dash, "FINAL TRACE", (w + 30, 50), font, 1.2, (0, 0, 0), 3)
     cv2.putText(dash, "(ACTUAL RESULT)", (w + 30, 90), font, 0.9, (50, 50, 50), 2)
     
-    # --- Footer ---
     cv2.rectangle(dash, (0, h), (w * 2, h + footer_height), (45, 40, 40), -1)
     cv2.putText(dash, "PERFORMANCE EVALUATION:", (40, h + 50), font, 1.2, (200, 200, 200), 2)
-    
     cv2.putText(dash, f"MEAN SCORE:    {acc_mean:.1f}%", (40, h + 105), font, 1.5, (255, 255, 255), 3)
     cv2.putText(dash, f"WITHIN {int(TOLERANCE_THRESHOLD_PX)}PX:    {acc_bounds:.1f}%", (40, h + 155), font, 1.5, (150, 255, 150), 3)
     
@@ -198,49 +241,184 @@ def create_dashboard(crop_start, crop_end, target_mask, drawn_mask, mean_err, ma
 
     return dash
 
-def main():
-    parser = argparse.ArgumentParser(description="Evaluate ACT policy line tracing.")
-    parser.add_argument("--start", required=True, help="Path to baseline image.")
-    parser.add_argument("--end", required=True, help="Path to final image.")
-    parser.add_argument("--output", default="evaluation_dashboard.jpg", help="Path to save output.")
-    args = parser.parse_args()
+def convert_lerobot_to_cv2(img_data):
+    """Converts a LeRobot camera observation tensor/array to a standard OpenCV BGR image."""
+    if hasattr(img_data, 'cpu'):
+        img_data = img_data.cpu().numpy()
+        
+    # Check if format is (Channels, Height, Width) and convert to (Height, Width, Channels)
+    if img_data.ndim == 3 and img_data.shape[0] == 3:
+        img_data = np.transpose(img_data, (1, 2, 0))
+        
+    # Un-normalize [0, 1] floats to [0, 255] uint8 if necessary
+    if img_data.dtype == np.float32 or img_data.dtype == np.float64:
+        if img_data.max() <= 1.0:
+            img_data = (img_data * 255).astype(np.uint8)
+            
+    return cv2.cvtColor(img_data, cv2.COLOR_RGB2BGR)
 
-    img_start = cv2.imread(args.start)
-    img_end = cv2.imread(args.end)
-
-    if img_start is None or img_end is None:
-        print("Error: Could not load one or both images.")
-        sys.exit(1)
-
-    if img_start.shape != img_end.shape:
-        print("Error: Image dimensions must match exactly.")
-        sys.exit(1)
-
+def run_evaluation_from_memory(raw_start, raw_end):
+    print("\n--- Running Computer Vision Evaluation ---")
+    img_start = convert_lerobot_to_cv2(raw_start)
+    img_end = convert_lerobot_to_cv2(raw_end)
+    
     x, y, w, h = auto_crop_whiteboard(img_start)
     crop_start = img_start[y:y+h, x:x+w]
     crop_end = img_end[y:y+h, x:x+w]
     
-    print(f"Cropped to whiteboard (with {LEFT_TRIM_PX}px left trim): {w}x{h}")
-
     mean_err, max_err, acc_mean, acc_bounds, target_mask, drawn_mask = evaluate_tracing(crop_start, crop_end)
-    
     dashboard_img = create_dashboard(crop_start, crop_end, target_mask, drawn_mask, mean_err, max_err, acc_mean, acc_bounds)
     
-    print(f"\n[EVALUATION COMPLETE]")
     print(f"Mean Score:      {acc_mean:.1f}%")
     print(f"Within {int(TOLERANCE_THRESHOLD_PX)}px:      {acc_bounds:.1f}%")
-    print(f"Mean Error:      {mean_err:.2f} px")
-    print(f"Max Error:       {max_err:.2f} px")
     
-    display_img = dashboard_img.copy()
-    if display_img.shape[0] > 900:
-        scale = 900 / display_img.shape[0]
-        display_img = cv2.resize(display_img, (0,0), fx=scale, fy=scale)
-
-    cv2.imwrite(args.output, dashboard_img)
-    cv2.imshow("ACT Policy Evaluation", display_img)
+    # Scale for display on Linux screens
+    if dashboard_img.shape[0] > 900:
+        scale = 900 / dashboard_img.shape[0]
+        dashboard_img = cv2.resize(dashboard_img, (0,0), fx=scale, fy=scale)
+    
+    print("\nEvaluation complete! Close the image window to fully exit.")
+    cv2.imshow("ACT Policy Evaluation", dashboard_img)
     cv2.waitKey(0)
-    cv2.destroyAllWindows()
+
+# ==========================================
+# --- TELEOPERATION LOGIC ---
+# ==========================================
+
+@dataclass
+class TeleoperateConfig:
+    teleop: TeleoperatorConfig
+    robot: RobotConfig
+    fps: int = 60
+    teleop_time_s: float | None = None
+    display_data: bool = False
+    display_ip: str | None = None
+    display_port: int | None = None
+    display_compressed_images: bool = False
+
+def teleop_loop(
+    teleop: Teleoperator,
+    robot: Robot,
+    fps: int,
+    teleop_action_processor: RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction],
+    robot_action_processor: RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction],
+    robot_observation_processor: RobotProcessorPipeline[RobotObservation, RobotObservation],
+    display_data: bool = False,
+    duration: float | None = None,
+    display_compressed_images: bool = False,
+):
+    display_len = max(len(key) for key in robot.action_features)
+    start = time.perf_counter()
+    
+    start_frame_raw = None
+    end_frame_raw = None
+    
+    try:
+        while True:
+            loop_start = time.perf_counter()
+            obs = robot.get_observation()
+
+            # --- In-Memory Auto-Capture ---
+            # We copy/clone the tensor directly to avoid slowing down the active loop
+            # Processing to CV2 is delayed until the evaluation phase
+            if "topRight" in obs:
+                frame_data = obs["topRight"]
+                if start_frame_raw is None:
+                    start_frame_raw = frame_data.clone() if hasattr(frame_data, 'clone') else frame_data.copy()
+                    print("\n[EVALUATOR] Captured starting baseline automatically.")
+                
+                # Continuously update the end frame so it's always the most recent
+                end_frame_raw = frame_data.clone() if hasattr(frame_data, 'clone') else frame_data.copy()
+
+            if robot.name == "unitree_g1":
+                teleop.send_feedback(obs)
+
+            raw_action = teleop.get_action()
+            teleop_action = teleop_action_processor((raw_action, obs))
+            robot_action_to_send = robot_action_processor((teleop_action, obs))
+            _ = robot.send_action(robot_action_to_send)
+
+            if display_data:
+                obs_transition = robot_observation_processor(obs)
+                log_rerun_data(
+                    observation=obs_transition,
+                    action=teleop_action,
+                    compress_images=display_compressed_images,
+                )
+
+                print("\n" + "-" * (display_len + 10))
+                print(f"{'NAME':<{display_len}} | {'NORM':>7}")
+                for motor, value in robot_action_to_send.items():
+                    print(f"{motor:<{display_len}} | {value:>7.2f}")
+                move_cursor_up(len(robot_action_to_send) + 3)
+
+            dt_s = time.perf_counter() - loop_start
+            precise_sleep(max(1 / fps - dt_s, 0.0))
+            loop_s = time.perf_counter() - loop_start
+            print(f"Teleop loop time: {loop_s * 1e3:.2f}ms ({1 / loop_s:.0f} Hz)")
+            move_cursor_up(1)
+
+            if duration is not None and time.perf_counter() - start >= duration:
+                break
+                
+    except KeyboardInterrupt:
+        print("\n\nTeleoperation interrupted by user (Ctrl+C).")
+        
+    return start_frame_raw, end_frame_raw
+
+
+@parser.wrap()
+def teleoperate(cfg: TeleoperateConfig):
+    init_logging()
+    logging.info(pformat(asdict(cfg)))
+    if cfg.display_data:
+        init_rerun(session_name="teleoperation", ip=cfg.display_ip, port=cfg.display_port)
+    display_compressed_images = (
+        True
+        if (cfg.display_data and cfg.display_ip is not None and cfg.display_port is not None)
+        else cfg.display_compressed_images
+    )
+
+    teleop = make_teleoperator_from_config(cfg.teleop)
+    robot = make_robot_from_config(cfg.robot)
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+
+    teleop.connect()
+    robot.connect()
+
+    start_img = None
+    end_img = None
+    
+    try:
+        # Loop returns the captured frames when it completes (or when Ctrl+C is pressed)
+        start_img, end_img = teleop_loop(
+            teleop=teleop,
+            robot=robot,
+            fps=cfg.fps,
+            display_data=cfg.display_data,
+            duration=cfg.teleop_time_s,
+            teleop_action_processor=teleop_action_processor,
+            robot_action_processor=robot_action_processor,
+            robot_observation_processor=robot_observation_processor,
+            display_compressed_images=display_compressed_images,
+        )
+    finally:
+        if cfg.display_data:
+            shutdown_rerun()
+        
+        # Safely disconnect the hardware BEFORE opening the CV window 
+        # so the robot motors don't lock up or cause USB issues
+        print("\nDisconnecting hardware...")
+        teleop.disconnect()
+        robot.disconnect()
+        
+        # Run the evaluation if we successfully captured frames
+        if start_img is not None and end_img is not None:
+            run_evaluation_from_memory(start_img, end_img)
+
+def main():
+    register_third_party_plugins()
+    teleoperate()
 
 if __name__ == "__main__":
     main()
